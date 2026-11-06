@@ -1,26 +1,43 @@
 #include <windows.h>
 
-const int ROWS = 10, COLS = 30, CELL = 30;
-const int FREE = 0, WALL = 1;
-int grid[ROWS][COLS];  // globals start as all zeros (FREE)
+const int ROWS = 10, COLS = 14, CELL = 64;
+const int DIRTY = 0, WALL = 1, CLEAN = 2;
+int grid[ROWS][COLS];  // globals start as all zeros (DIRTY)
 
 // Windows calls this every time something happens to the window.
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+
+    // Painting the window
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT whole = {0, 0, COLS * CELL, ROWS * CELL};
-        SetDCBrushColor(hdc, RGB(0, 0, 0));   // outline color
+        SetDCBrushColor(hdc, RGB(138, 133, 133));   // outline color
         FillRect(hdc, &whole, (HBRUSH)GetStockObject(DC_BRUSH));
+
+        grid[0][1] = WALL;  // mark the top left cell as wall
+        grid[1][1] = WALL;  // mark the cell below it as wall
+
+        // paint each cell depending on whether it's a wall or DIRTY space
         for (int r = 0; r < ROWS; r++) {
             for (int c = 0; c < COLS; c++) {
-                COLORREF color = (grid[r][c] == WALL) ? RGB(70, 70, 70) : RGB(245, 245, 245);
+                COLORREF color;
+                if (grid[r][c] == WALL) {
+                    color = RGB(168, 164, 164);
+                } else if (grid[r][c] == DIRTY) {
+                    color = RGB(59, 48, 48);
+                } else if (grid[r][c] == CLEAN) {
+                    color = RGB(255, 255, 255);
+                }
                 SetDCBrushColor(hdc, color);
                 RECT cell = {c * CELL, r * CELL, (c + 1) * CELL - 1, (r + 1) * CELL - 1};
                 FillRect(hdc, &cell, (HBRUSH)GetStockObject(DC_BRUSH));
             }
         }
+
+        
+
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -32,10 +49,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR, int show) {
-    // put walls around the border
-    for (int r = 0; r < ROWS; r++)
-        for (int c = 0; c < COLS; c++)
-            if (r == 0 || c == 0 || r == ROWS - 1 || c == COLS - 1) grid[r][c] = WALL;
 
     // describe the window
     WNDCLASSA wc = {};
