@@ -1,4 +1,7 @@
 #include <windows.h>
+#include <algorithm>
+#include <array>
+#include <string>
 #include <vector>
 
 constexpr int ROWS = 10, COLS = 14, CELL = 48;
@@ -67,7 +70,133 @@ const Scenario scenarios[] = {
 };
 constexpr int SCENARIO_COUNT = sizeof(scenarios) / sizeof(scenarios[0]);
 
-HWND layoutMenu = nullptr;
+HWND layoutMenu = nullptr, cleanButton = nullptr;
+constexpr UINT_PTR ROBOT_TIMER = 1;
+std::array<bool, ROWS * COLS> blocked{}, cleaned{};
+std::vector<int> path;
+std::size_t nextStep = 0;
+int home = -1, robot = -1;
+int floorCount = 0, cleanedCount = 0, moves = 0;
+bool running = false, finished = false;
+
+struct SearchResult {
+    std::array<int, ROWS * COLS> parent;
+    std::vector<int> order;
+};
+
+// Process cells in the order discovered. That makes this vector a BFS queue.
+SearchResult BFS(int start) {
+    SearchResult search;
+    search.parent.fill(-1);
+    search.parent[start] = start;
+    search.order.push_back(start);
+    const int rowChange[] = {-1, 0, 1, 0};
+    const int colChange[] = {0, 1, 0, -1};
+    for (std::size_t index = 0; index < search.order.size(); ++index) {
+        const int current = search.order[index];
+        for (int direction = 0; direction < 4; ++direction) {
+            const int row = current / COLS + rowChange[direction];
+            const int col = current % COLS + colChange[direction];
+            if (row < 0 || row >= ROWS || col < 0 || col >= COLS) continue;
+            const int next = row * COLS + col;
+            if (!blocked[next] && search.parent[next] == -1) {
+                search.parent[next] = current;
+                search.order.push_back(next);
+            }
+        }
+    }
+    return search;
+}
+
+void BlockAreas(const std::vector<CellRect>& areas) {
+    for (const auto& area : areas) {
+        for (int row = area.row; row < area.row + area.height; ++row) {
+            for (int col = area.col; col < area.col + area.width; ++col) {
+                blocked[row * COLS + col] = true;
+            }
+        }
+    }
+}
+
+// Changing the selection also resets the robot and the cleaning counters.
+void SelectScenario(HWND hwnd) {
+    KillTimer(hwnd, ROBOT_TIMER);
+    running = finished = false;
+    home = robot = -1;
+    floorCount = cleanedCount = moves = 0;
+    blocked.fill(false);
+    cleaned.fill(false);
+    path.clear();
+    nextStep = 0;
+    const LRESULT choice = SendMessageA(layoutMenu, CB_GETCURSEL, 0, 0);
+    if (choice >= 1 && choice <= SCENARIO_COUNT) {
+        const auto& scenario = scenarios[choice - 1];
+        BlockAreas(scenario.walls);
+        BlockAreas(scenario.cutouts);
+        BlockAreas(scenario.furniture);
+        home = scenario.homeRow * COLS + scenario.homeCol;
+        robot = home;
+        floorCount = static_cast<int>(BFS(home).order.size());
+        cleaned[home] = true;
+        cleanedCount = 1;
+    }
+    SetWindowTextA(cleanButton, "Start cleaning");
+    EnableWindow(cleanButton, home >= 0);
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void PlanNextPath() {
+    const SearchResult search = BFS(robot);
+    int target = home;
+    for (int cell : search.order) {
+        if (!cleaned[cell]) {
+            target = cell;
+            break;
+        }
+    }
+    // With no dirty squares left, the target stays at home.
+    path.clear();
+    for (int cell = target; cell != robot; cell = search.parent[cell]) {
+        path.push_back(cell);
+    }
+    std::reverse(path.begin(), path.end());
+    nextStep = 0;
+}
+
+void MoveRobot(HWND hwnd) {
+    if (nextStep == path.size()) PlanNextPath();
+    if (path.empty()) {
+        KillTimer(hwnd, ROBOT_TIMER);
+        running = false;
+        finished = true;
+        SetWindowTextA(cleanButton, "Replay cleaning");
+    } else {
+        robot = path[nextStep++];
+        ++moves;
+        if (!cleaned[robot]) {
+            cleaned[robot] = true;
+            ++cleanedCount;
+        }
+    }
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void ToggleCleaning(HWND hwnd) {
+    if (home < 0) return;
+    if (running) {
+        KillTimer(hwnd, ROBOT_TIMER);
+        running = false;
+        SetWindowTextA(cleanButton, "Resume cleaning");
+    } else {
+        if (finished) SelectScenario(hwnd);
+        if (!SetTimer(hwnd, ROBOT_TIMER, 120, nullptr)) {
+            MessageBoxA(hwnd, "Could not start the timer.", "Roomba", MB_OK | MB_ICONERROR);
+            return;
+        }
+        running = true;
+        SetWindowTextA(cleanButton, "Pause cleaning");
+    }
+}
 
 // Convert a rectangle in grid cells to a rectangle in screen pixels.
 RECT CellBox(const CellRect& area) {
@@ -86,7 +215,8 @@ void DrawRoom(HDC dc, const Scenario& scenario) {
             RECT cell = CellBox({col, row, 1, 1});
             --cell.right;
             --cell.bottom;
-            FillColor(dc, cell, RGB(59, 48, 48));
+            const COLORREF color = cleaned[row * COLS + col] ? RGB(98, 70, 59) : RGB(59, 48, 48);
+            FillColor(dc, cell, color);
         }
     }
     for (const auto& wall : scenario.walls) {
@@ -108,20 +238,28 @@ void DrawRoom(HDC dc, const Scenario& scenario) {
     }
 
     RECT dock = CellBox({scenario.homeCol, scenario.homeRow, 1, 1});
-    InflateRect(&dock, -9, -9);
+    DrawTextA(dc, "H", -1, &dock, center);
+    RECT body = CellBox({robot % COLS, robot / COLS, 1, 1});
+    InflateRect(&body, -9, -9);
     SetDCPenColor(dc, BACKGROUND);
     SetDCBrushColor(dc, RGB(249, 179, 140));
-    Ellipse(dc, dock.left, dock.top, dock.right, dock.bottom);
+    Ellipse(dc, body.left, body.top, body.right, body.bottom);
     SetTextColor(dc, BACKGROUND);
-    DrawTextA(dc, "R", -1, &dock, center);
+    DrawTextA(dc, "R", -1, &body, center);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_COMMAND:
         if (reinterpret_cast<HWND>(lp) == layoutMenu && HIWORD(wp) == CBN_SELCHANGE) {
-            InvalidateRect(hwnd, nullptr, FALSE);
+            SelectScenario(hwnd);
         }
+        if (reinterpret_cast<HWND>(lp) == cleanButton && HIWORD(wp) == BN_CLICKED) {
+            ToggleCleaning(hwnd);
+        }
+        return 0;
+    case WM_TIMER:
+        if (wp == ROBOT_TIMER && running) MoveRobot(hwnd);
         return 0;
     case WM_PAINT: {
         PAINTSTRUCT paint{};
@@ -138,11 +276,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         const LRESULT choice = layoutMenu ? SendMessageA(layoutMenu, CB_GETCURSEL, 0, 0) : 0;
         if (choice >= 1 && choice <= SCENARIO_COUNT) {
             DrawRoom(dc, scenarios[choice - 1]);
+            const std::string status = "Cleaned " + std::to_string(cleanedCount) + "/" +
+                std::to_string(floorCount) + " | Moves " + std::to_string(moves) +
+                (finished ? " | Finished at home" : "");
+            SetTextColor(dc, LABEL_COLOR);
+            RECT statusBox{LEFT + 300, 9, LEFT + COLS * CELL, 30};
+            DrawTextA(dc, status.c_str(), -1, &statusBox, DT_LEFT | DT_SINGLELINE);
+            RECT legend{LEFT, TOP + ROWS * CELL + 5, LEFT + COLS * CELL, TOP + ROWS * CELL + 27};
+            DrawTextA(dc, "Warm brown = clean   R = robot   H = home", -1, &legend, DT_LEFT | DT_SINGLELINE);
         }
         EndPaint(hwnd, &paint);
         return 0;
     }
     case WM_DESTROY:
+        KillTimer(hwnd, ROBOT_TIMER);
         PostQuitMessage(0);
         return 0;
     }
@@ -158,9 +305,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!RegisterClassA(&windowClass)) return 1;
 
     const DWORD style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT size{0, 0, 2 * LEFT + COLS * CELL, TOP + ROWS * CELL + 20};
+    RECT size{0, 0, 2 * LEFT + COLS * CELL, TOP + ROWS * CELL + 32};
     AdjustWindowRect(&size, style, FALSE);
-    HWND hwnd = CreateWindowA(windowClass.lpszClassName, "Roomba - Scenario Preview", style,
+    HWND hwnd = CreateWindowA(windowClass.lpszClassName, "Roomba - BFS Cleaning", style,
         CW_USEDEFAULT, CW_USEDEFAULT, size.right - size.left, size.bottom - size.top,
         nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
@@ -175,6 +322,11 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
         SendMessageA(layoutMenu, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(scenario.name));
     }
     SendMessageA(layoutMenu, CB_SETCURSEL, 0, 0);
+    cleanButton = CreateWindowA("BUTTON", "Start cleaning", WS_CHILD | WS_VISIBLE,
+        LEFT + 300, 31, 160, 27, hwnd, nullptr, instance, nullptr);
+    if (!cleanButton) return 1;
+    SendMessageA(cleanButton, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    EnableWindow(cleanButton, FALSE);
     ShowWindow(hwnd, show);
     SetFocus(layoutMenu);
 
