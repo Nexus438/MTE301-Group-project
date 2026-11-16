@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -77,10 +78,12 @@ std::vector<int> path;
 std::size_t nextStep = 0;
 int home = -1, robot = -1;
 int floorCount = 0, cleanedCount = 0, moves = 0;
+int baselineMoves = 0;
 bool running = false, finished = false;
 
 struct SearchResult {
     std::array<int, ROWS * COLS> parent;
+    std::array<int, ROWS * COLS> distance;
     std::vector<int> order;
 };
 
@@ -88,7 +91,9 @@ struct SearchResult {
 SearchResult BFS(int start) {
     SearchResult search;
     search.parent.fill(-1);
+    search.distance.fill(-1);
     search.parent[start] = start;
+    search.distance[start] = 0;
     search.order.push_back(start);
     const int rowChange[] = {-1, 0, 1, 0};
     const int colChange[] = {0, 1, 0, -1};
@@ -101,6 +106,7 @@ SearchResult BFS(int start) {
             const int next = row * COLS + col;
             if (!blocked[next] && search.parent[next] == -1) {
                 search.parent[next] = current;
+                search.distance[next] = search.distance[current] + 1;
                 search.order.push_back(next);
             }
         }
@@ -118,12 +124,167 @@ void BlockAreas(const std::vector<CellRect>& areas) {
     }
 }
 
+// Add the real grid moves for one connection in a visiting order.
+void AppendShortestPath(std::vector<int>& steps, int from, int to, const SearchResult& search) {
+    std::vector<int> segment;
+    for (int cell = to; cell != from; cell = search.parent[cell]) {
+        segment.push_back(cell);
+    }
+    std::reverse(segment.begin(), segment.end());
+    steps.insert(steps.end(), segment.begin(), segment.end());
+}
+
+int RouteLength(const std::vector<int>& order, const std::vector<SearchResult>& searches) {
+    int length = 0;
+    for (std::size_t index = 1; index < order.size(); ++index) {
+        length += searches[order[index - 1]].distance[order[index]];
+    }
+    return length;
+}
+
+// Reproduce the nearest-dirty-square route used in the previous stage.
+std::vector<int> GreedyOrder(const std::vector<SearchResult>& searches) {
+    std::array<bool, ROWS * COLS> visited{};
+    std::vector<int> order{home};
+    visited[home] = true;
+    while (order.size() < searches[home].order.size()) {
+        for (int cell : searches[order.back()].order) {
+            if (!visited[cell]) {
+                order.push_back(cell);
+                visited[cell] = true;
+                break;
+            }
+        }
+    }
+    order.push_back(home);
+    return order;
+}
+
+// Shuffling changes which square wins when several are equally close.
+std::vector<int> RandomNearestOrder(std::vector<int> remaining,
+                                   const std::vector<SearchResult>& searches,
+                                   std::mt19937& random) {
+    std::shuffle(remaining.begin(), remaining.end(), random);
+    std::vector<int> order{home};
+    while (!remaining.empty()) {
+        const int current = order.back();
+        const auto nearest = std::min_element(remaining.begin(), remaining.end(),
+            [&searches, current](int first, int second) {
+                return searches[current].distance[first] < searches[current].distance[second];
+            });
+        order.push_back(*nearest);
+        remaining.erase(nearest);
+    }
+    order.push_back(home);
+    return order;
+}
+
+std::vector<int> ClosedOrder(std::vector<int> cells) {
+    cells.insert(cells.begin(), home);
+    cells.push_back(home);
+    return cells;
+}
+
+// Keep home fixed. Reverse a section only when its two new connections save moves.
+// The grid is undirected, so reversing the connections inside that section costs the same.
+void Optimize2Opt(std::vector<int>& order, const std::vector<SearchResult>& searches) {
+    while (true) {
+        int bestSaving = 0;
+        std::size_t bestFirst = 0, bestLast = 0;
+        for (std::size_t first = 1; first + 2 < order.size(); ++first) {
+            for (std::size_t last = first + 1; last + 1 < order.size(); ++last) {
+                const int before = order[first - 1], start = order[first];
+                const int end = order[last], after = order[last + 1];
+                const int oldLength = searches[before].distance[start] + searches[end].distance[after];
+                const int newLength = searches[before].distance[end] + searches[start].distance[after];
+                const int saving = oldLength - newLength;
+                if (saving > bestSaving) {
+                    bestSaving = saving;
+                    bestFirst = first;
+                    bestLast = last;
+                }
+            }
+        }
+        if (bestSaving == 0) {
+            return;
+        }
+        std::reverse(order.begin() + bestFirst, order.begin() + bestLast + 1);
+    }
+}
+
+void PlanCleaning() {
+    // Only cache searches for floor squares connected to the dock.
+    std::vector<SearchResult> searches(ROWS * COLS);
+    searches[home] = BFS(home);
+    const auto& floor = searches[home].order;
+    floorCount = static_cast<int>(floor.size());
+    for (int cell : floor) {
+        if (cell != home) {
+            searches[cell] = BFS(cell);
+        }
+    }
+
+    std::vector<int> bestOrder = GreedyOrder(searches);
+    baselineMoves = RouteLength(bestOrder, searches);
+    int bestLength = baselineMoves;
+    std::vector<std::vector<int>> candidates{bestOrder};
+    std::vector<int> cells(floor.begin() + 1, floor.end());
+
+    // Add a sweep across rows, then a sweep across columns.
+    std::sort(cells.begin(), cells.end(), [](int first, int second) {
+        const int firstRow = first / COLS, secondRow = second / COLS;
+        if (firstRow != secondRow) {
+            return firstRow < secondRow;
+        }
+        return firstRow % 2 == 0 ? first < second : first > second;
+    });
+    candidates.push_back(ClosedOrder(cells));
+    std::sort(cells.begin(), cells.end(), [](int first, int second) {
+        const int firstCol = first % COLS, secondCol = second % COLS;
+        if (firstCol != secondCol) {
+            return firstCol < secondCol;
+        }
+        return firstCol % 2 == 0 ? first < second : first > second;
+    });
+    candidates.push_back(ClosedOrder(cells));
+
+    // A fixed seed makes replay use the same plan on the same build.
+    std::mt19937 random(42);
+    for (int trial = 0; trial < 8; ++trial) {
+        candidates.push_back(RandomNearestOrder(cells, searches, random));
+    }
+    for (int trial = 0; trial < 8; ++trial) {
+        std::shuffle(cells.begin(), cells.end(), random);
+        candidates.push_back(ClosedOrder(cells));
+    }
+
+    // Preserve the original route as a fallback, then improve every candidate.
+    // 2-opt finds local improvements. Shorter routes can still exist.
+    for (auto& candidate : candidates) {
+        Optimize2Opt(candidate, searches);
+        const int length = RouteLength(candidate, searches);
+        if (length < bestLength) {
+            bestOrder = candidate;
+            bestLength = length;
+        }
+    }
+
+    // Convert the chosen visiting order into adjacent grid moves for the animation.
+    path.clear();
+    for (std::size_t index = 1; index < bestOrder.size(); ++index) {
+        const int from = bestOrder[index - 1], to = bestOrder[index];
+        AppendShortestPath(path, from, to, searches[from]);
+    }
+    nextStep = 0;
+}
+
 // Changing the selection also resets the robot and the cleaning counters.
 void SelectScenario(HWND hwnd) {
     KillTimer(hwnd, ROBOT_TIMER);
     running = finished = false;
     home = robot = -1;
     floorCount = cleanedCount = moves = 0;
+    baselineMoves = 0;
     blocked.fill(false);
     cleaned.fill(false);
     path.clear();
@@ -136,7 +297,7 @@ void SelectScenario(HWND hwnd) {
         BlockAreas(scenario.furniture);
         home = scenario.homeRow * COLS + scenario.homeCol;
         robot = home;
-        floorCount = static_cast<int>(BFS(home).order.size());
+        PlanCleaning();
         cleaned[home] = true;
         cleanedCount = 1;
     }
@@ -145,27 +306,8 @@ void SelectScenario(HWND hwnd) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-void PlanNextPath() {
-    const SearchResult search = BFS(robot);
-    int target = home;
-    for (int cell : search.order) {
-        if (!cleaned[cell]) {
-            target = cell;
-            break;
-        }
-    }
-    // With no dirty squares left, the target stays at home.
-    path.clear();
-    for (int cell = target; cell != robot; cell = search.parent[cell]) {
-        path.push_back(cell);
-    }
-    std::reverse(path.begin(), path.end());
-    nextStep = 0;
-}
-
 void MoveRobot(HWND hwnd) {
-    if (nextStep == path.size()) PlanNextPath();
-    if (path.empty()) {
+    if (nextStep == path.size()) {
         KillTimer(hwnd, ROBOT_TIMER);
         running = false;
         finished = true;
@@ -277,13 +419,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
         if (choice >= 1 && choice <= SCENARIO_COUNT) {
             DrawRoom(dc, scenarios[choice - 1]);
             const std::string status = "Cleaned " + std::to_string(cleanedCount) + "/" +
-                std::to_string(floorCount) + " | Moves " + std::to_string(moves) +
+                std::to_string(floorCount) + " | Moves " + std::to_string(moves) + "/" +
+                std::to_string(path.size()) +
                 (finished ? " | Finished at home" : "");
             SetTextColor(dc, LABEL_COLOR);
             RECT statusBox{LEFT + 300, 9, LEFT + COLS * CELL, 30};
             DrawTextA(dc, status.c_str(), -1, &statusBox, DT_LEFT | DT_SINGLELINE);
             RECT legend{LEFT, TOP + ROWS * CELL + 5, LEFT + COLS * CELL, TOP + ROWS * CELL + 27};
             DrawTextA(dc, "Warm brown = clean   R = robot   H = home", -1, &legend, DT_LEFT | DT_SINGLELINE);
+            const int plannedMoves = static_cast<int>(path.size());
+            const std::string comparison = "Original route " + std::to_string(baselineMoves) +
+                " moves | Chosen route " + std::to_string(plannedMoves) + " moves | Saved " +
+                std::to_string(baselineMoves - plannedMoves);
+            RECT comparisonBox{LEFT, TOP + ROWS * CELL + 28, LEFT + COLS * CELL, TOP + ROWS * CELL + 50};
+            DrawTextA(dc, comparison.c_str(), -1, &comparisonBox, DT_LEFT | DT_SINGLELINE);
         }
         EndPaint(hwnd, &paint);
         return 0;
@@ -305,9 +454,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!RegisterClassA(&windowClass)) return 1;
 
     const DWORD style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
-    RECT size{0, 0, 2 * LEFT + COLS * CELL, TOP + ROWS * CELL + 32};
+    RECT size{0, 0, 2 * LEFT + COLS * CELL, TOP + ROWS * CELL + 56};
     AdjustWindowRect(&size, style, FALSE);
-    HWND hwnd = CreateWindowA(windowClass.lpszClassName, "Roomba - BFS Cleaning", style,
+    HWND hwnd = CreateWindowA(windowClass.lpszClassName, "Roomba - BFS + 2-opt", style,
         CW_USEDEFAULT, CW_USEDEFAULT, size.right - size.left, size.bottom - size.top,
         nullptr, nullptr, instance, nullptr);
     if (!hwnd) return 1;
