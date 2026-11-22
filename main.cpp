@@ -6,7 +6,7 @@
 #include <vector>
 
 constexpr int ROWS = 10, COLS = 14, CELL = 48;
-constexpr int LEFT = 20, TOP = 72;
+constexpr int LEFT = 42, TOP = 94;
 constexpr COLORREF BACKGROUND = RGB(39, 27, 27);
 constexpr COLORREF LABEL_COLOR = RGB(237, 237, 237);
 
@@ -351,7 +351,90 @@ void FillColor(HDC dc, RECT box, COLORREF color) {
     FillRect(dc, &box, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
 
+POINT CellCenter(int cell) {
+    return {LEFT + (cell % COLS) * CELL + CELL / 2,
+            TOP + (cell / COLS) * CELL + CELL / 2};
+}
+
+void DrawLine(HDC dc, int startX, int startY, int endX, int endY) {
+    MoveToEx(dc, startX, startY, nullptr);
+    LineTo(dc, endX, endY);
+}
+
+void DrawGridNumbers(HDC dc) {
+    const UINT center = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
+    for (int col = 0; col < COLS; ++col) {
+        RECT label{LEFT + col * CELL, TOP - 24, LEFT + (col + 1) * CELL, TOP - 2};
+        const std::string number = std::to_string(col + 1);
+        DrawTextA(dc, number.c_str(), -1, &label, center);
+    }
+    for (int row = 0; row < ROWS; ++row) {
+        RECT label{6, TOP + row * CELL, LEFT - 6, TOP + (row + 1) * CELL};
+        const std::string number = std::to_string(row + 1);
+        DrawTextA(dc, number.c_str(), -1, &label, center);
+    }
+}
+
+// Outline the actual room, including the missing corner in the loft.
+void DrawRoomOutline(HDC dc, const Scenario& scenario) {
+    std::array<bool, ROWS * COLS> inside;
+    inside.fill(true);
+    for (const auto& area : scenario.cutouts) {
+        for (int row = area.row; row < area.row + area.height; ++row) {
+            for (int col = area.col; col < area.col + area.width; ++col) {
+                inside[row * COLS + col] = false;
+            }
+        }
+    }
+    SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCPenColor(dc, LABEL_COLOR);
+    for (int row = 0; row < ROWS; ++row) {
+        for (int col = 0; col < COLS; ++col) {
+            const int cell = row * COLS + col;
+            if (!inside[cell]) continue;
+            const RECT box = CellBox({col, row, 1, 1});
+            if (row == 0 || !inside[cell - COLS]) {
+                DrawLine(dc, box.left, box.top, box.right, box.top);
+            }
+            if (row == ROWS - 1 || !inside[cell + COLS]) {
+                DrawLine(dc, box.left, box.bottom, box.right, box.bottom);
+            }
+            if (col == 0 || !inside[cell - 1]) {
+                DrawLine(dc, box.left, box.top, box.left, box.bottom);
+            }
+            if (col == COLS - 1 || !inside[cell + 1]) {
+                DrawLine(dc, box.right, box.top, box.right, box.bottom);
+            }
+        }
+    }
+}
+
+// Draw only the moves already taken. Repeated passages get a dotted line.
+void DrawTrail(HDC dc) {
+    HPEN solid = CreatePen(PS_SOLID, 1, RGB(167, 135, 113));
+    HPEN dotted = CreatePen(PS_DOT, 1, RGB(237, 216, 199));
+    HGDIOBJ previousPen = SelectObject(dc, GetStockObject(DC_PEN));
+    SetDCPenColor(dc, RGB(167, 135, 113));
+    std::array<std::array<bool, ROWS * COLS>, ROWS * COLS> crossed{};
+    int previousCell = home;
+    for (std::size_t index = 0; index < nextStep; ++index) {
+        const int current = path[index];
+        HPEN pen = crossed[previousCell][current] ? dotted : solid;
+        SelectObject(dc, pen ? pen : GetStockObject(DC_PEN));
+        const POINT start = CellCenter(previousCell), end = CellCenter(current);
+        DrawLine(dc, start.x, start.y, end.x, end.y);
+        crossed[previousCell][current] = true;
+        crossed[current][previousCell] = true;
+        previousCell = current;
+    }
+    SelectObject(dc, previousPen);
+    if (solid) DeleteObject(solid);
+    if (dotted) DeleteObject(dotted);
+}
+
 void DrawRoom(HDC dc, const Scenario& scenario) {
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SelectObject(dc, GetStockObject(NULL_PEN));
     for (int row = 0; row < ROWS; ++row) {
         for (int col = 0; col < COLS; ++col) {
             RECT cell = CellBox({col, row, 1, 1});
@@ -359,6 +442,11 @@ void DrawRoom(HDC dc, const Scenario& scenario) {
             --cell.bottom;
             const COLORREF color = cleaned[row * COLS + col] ? RGB(98, 70, 59) : RGB(59, 48, 48);
             FillColor(dc, cell, color);
+            if (!blocked[row * COLS + col] && !cleaned[row * COLS + col]) {
+                const POINT center = CellCenter(row * COLS + col);
+                SetDCBrushColor(dc, RGB(139, 124, 117));
+                Ellipse(dc, center.x - 1, center.y - 1, center.x + 1, center.y + 1);
+            }
         }
     }
     for (const auto& wall : scenario.walls) {
@@ -367,6 +455,10 @@ void DrawRoom(HDC dc, const Scenario& scenario) {
     for (const auto& cutout : scenario.cutouts) {
         FillColor(dc, CellBox(cutout), BACKGROUND);
     }
+
+    DrawGridNumbers(dc);
+    DrawRoomOutline(dc, scenario);
+    DrawTrail(dc);
 
     SelectObject(dc, GetStockObject(DC_BRUSH));
     SelectObject(dc, GetStockObject(DC_PEN));
@@ -390,6 +482,59 @@ void DrawRoom(HDC dc, const Scenario& scenario) {
     DrawTextA(dc, "R", -1, &body, center);
 }
 
+void DrawScene(HDC dc, RECT client) {
+    FillColor(dc, client, BACKGROUND);
+    SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    SetTextColor(dc, LABEL_COLOR);
+    SetBkMode(dc, TRANSPARENT);
+
+    RECT caption{LEFT, 9, LEFT + 280, 30};
+    DrawTextA(dc, "Choose a home layout", -1, &caption, DT_LEFT | DT_SINGLELINE);
+    const LRESULT choice = layoutMenu ? SendMessageA(layoutMenu, CB_GETCURSEL, 0, 0) : 0;
+    if (choice < 1 || choice > SCENARIO_COUNT) return;
+    DrawRoom(dc, scenarios[choice - 1]);
+    const std::string status = "Cleaned " + std::to_string(cleanedCount) + "/" +
+        std::to_string(floorCount) + " | Moves " + std::to_string(moves) + "/" +
+        std::to_string(path.size()) + (finished ? " | Finished at home" : "");
+    SetTextColor(dc, LABEL_COLOR);
+    RECT statusBox{LEFT + 300, 9, LEFT + COLS * CELL, 30};
+    DrawTextA(dc, status.c_str(), -1, &statusBox, DT_LEFT | DT_SINGLELINE);
+    RECT legend{LEFT, TOP + ROWS * CELL + 5, LEFT + COLS * CELL, TOP + ROWS * CELL + 27};
+    DrawTextA(dc, "Brown = clean   R = robot   H = home   Solid trail = first pass   Dotted = repeat",
+              -1, &legend, DT_LEFT | DT_SINGLELINE);
+    const int plannedMoves = static_cast<int>(path.size());
+    const std::string comparison = "Original route " + std::to_string(baselineMoves) +
+        " moves | Chosen route " + std::to_string(plannedMoves) + " moves | Saved " +
+        std::to_string(baselineMoves - plannedMoves);
+    RECT comparisonBox{LEFT, TOP + ROWS * CELL + 28, LEFT + COLS * CELL, TOP + ROWS * CELL + 50};
+    DrawTextA(dc, comparison.c_str(), -1, &comparisonBox, DT_LEFT | DT_SINGLELINE);
+}
+
+// Draw a complete frame offscreen, then copy it into the window in one operation.
+void PaintWindow(HWND hwnd) {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(hwnd, &paint);
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int width = client.right - client.left, height = client.bottom - client.top;
+    if (width > 0 && height > 0) {
+        HDC buffer = CreateCompatibleDC(dc);
+        HBITMAP bitmap = buffer ? CreateCompatibleBitmap(dc, width, height) : nullptr;
+        HGDIOBJ previousBitmap = bitmap ? SelectObject(buffer, bitmap) : nullptr;
+        const bool buffered = previousBitmap && previousBitmap != HGDI_ERROR;
+        DrawScene(buffered ? buffer : dc, client);
+        if (buffered) {
+            if (!BitBlt(dc, 0, 0, width, height, buffer, 0, 0, SRCCOPY)) {
+                DrawScene(dc, client);
+            }
+            SelectObject(buffer, previousBitmap);
+        }
+        if (bitmap) DeleteObject(bitmap);
+        if (buffer) DeleteDC(buffer);
+    }
+    EndPaint(hwnd, &paint);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_COMMAND:
@@ -403,40 +548,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == ROBOT_TIMER && running) MoveRobot(hwnd);
         return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        HDC dc = BeginPaint(hwnd, &paint);
-        RECT client{};
-        GetClientRect(hwnd, &client);
-        FillColor(dc, client, BACKGROUND);
-        SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-        SetTextColor(dc, LABEL_COLOR);
-        SetBkMode(dc, TRANSPARENT);
-
-        RECT caption{LEFT, 9, LEFT + 280, 30};
-        DrawTextA(dc, "Choose a home layout", -1, &caption, DT_LEFT | DT_SINGLELINE);
-        const LRESULT choice = layoutMenu ? SendMessageA(layoutMenu, CB_GETCURSEL, 0, 0) : 0;
-        if (choice >= 1 && choice <= SCENARIO_COUNT) {
-            DrawRoom(dc, scenarios[choice - 1]);
-            const std::string status = "Cleaned " + std::to_string(cleanedCount) + "/" +
-                std::to_string(floorCount) + " | Moves " + std::to_string(moves) + "/" +
-                std::to_string(path.size()) +
-                (finished ? " | Finished at home" : "");
-            SetTextColor(dc, LABEL_COLOR);
-            RECT statusBox{LEFT + 300, 9, LEFT + COLS * CELL, 30};
-            DrawTextA(dc, status.c_str(), -1, &statusBox, DT_LEFT | DT_SINGLELINE);
-            RECT legend{LEFT, TOP + ROWS * CELL + 5, LEFT + COLS * CELL, TOP + ROWS * CELL + 27};
-            DrawTextA(dc, "Warm brown = clean   R = robot   H = home", -1, &legend, DT_LEFT | DT_SINGLELINE);
-            const int plannedMoves = static_cast<int>(path.size());
-            const std::string comparison = "Original route " + std::to_string(baselineMoves) +
-                " moves | Chosen route " + std::to_string(plannedMoves) + " moves | Saved " +
-                std::to_string(baselineMoves - plannedMoves);
-            RECT comparisonBox{LEFT, TOP + ROWS * CELL + 28, LEFT + COLS * CELL, TOP + ROWS * CELL + 50};
-            DrawTextA(dc, comparison.c_str(), -1, &comparisonBox, DT_LEFT | DT_SINGLELINE);
-        }
-        EndPaint(hwnd, &paint);
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        PaintWindow(hwnd);
         return 0;
-    }
     case WM_DESTROY:
         KillTimer(hwnd, ROBOT_TIMER);
         PostQuitMessage(0);
